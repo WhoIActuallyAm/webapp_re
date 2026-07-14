@@ -1,6 +1,9 @@
 package org.looom;
 
+import javax.crypto.BadPaddingException;
+import javax.crypto.IllegalBlockSizeException;
 import java.io.IOException;
+import java.io.UnsupportedEncodingException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.util.Scanner;
@@ -11,7 +14,20 @@ import java.util.stream.Stream;
 public class Main {
     public static void main(String[] args) {
 //        interactiveDecrypt();
-        decryptWebAppFiles();
+//        decryptWebAppFiles();
+        getrun();
+    }
+
+    private static void getrun() {
+        String text = ":de6d69dg58;e25j;47ddd52fe;cf;256e;:6h984fe39hdd22753ece9i447cfg79:64fd534f8548c4iff4cc99547;84efe;h9ieh45c45gc3e787c25d49766763;gd;5j5:243f78777;69c:4;e735fd;g43;9f92jcc7;g4f5734fg2ce67:d35de;3747:;8d5fdef8cdjde88fc4d3i7ecf;j92e65736d5ei9jf696di792hc43d8i3:78c8g2d32;685fd:86:i5g::2h923h24e9;9;;774;8d9i5eg5c45e494;56e28hd55865:i24cg3g5493fhcj9774f5646;cg6;937;822c:3c5;24c5g6;e262f56gci6jeif92:c::h744gd992e8:498229ed4d3cdd9c334f4f;9d;3;e27fj2:94234;:7e6c82::3fh:585fffc53ff2f2:3j4e765g36e33e4ef45j6f876:9g2g;e95234e:;748h33858hec;ie;ed2;f87;78c;dg3jdj2f5g;c;;5j;f4d:g;;7h8ff98id92c8ed56cef4f74cf3;e7;5689578g2:47c58866g88;h87;5ei5:8i6;cgf73:64:;6d2d;h3g8:5gc;23;d;fe653d8e8;2385e37ch87ch6i3e82dg399j7:";
+        byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
+        for (int i = 0; i < bytes.length; i++) {
+            bytes[i] = (byte) (bytes[i] - 2);
+        }
+        String toaes = new String(bytes);
+        gf gf = gf_tools.gf_new();
+        String res = gf.b(toaes);
+        System.out.println(res);
     }
 
     private static void interactiveDecrypt() {

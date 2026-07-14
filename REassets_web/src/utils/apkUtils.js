@@ -5,7 +5,11 @@
 
 import JSZip from 'jszip';
 import { getMetaDataValue } from './axmlParser.js';
-import { deriveDesKey, decryptFileBytes } from './decryptUtils.js';
+import {
+  deriveDesKey, decryptFileBytes,
+  isGetrunEncrypted, extractGetrunPayload,
+  gfBString, bytesSub2, hasGarbledChars
+} from './decryptUtils.js';
 
 // 需要解密的文件后缀
 const DECRYPT_EXTENSIONS = /\.(html|js|css)$/i;
@@ -51,20 +55,55 @@ export async function detectMetaData(apkFile) {
 }
 
 /**
- * 处理 APK 文件：解密 assets/webapp 目录
+ * 检测 APK 中文件的加密类型
+ * @param {File|Blob} apkFile - 用户上传的 APK 文件
+ * @returns {Promise<{ type: 'getrun'|'fullaes', assetFiles: string[], metaValue: string|null }>}
+ */
+export async function detectEncryptionType(apkFile) {
+  try {
+    const zip = await JSZip.loadAsync(apkFile);
+
+    // 获取 assets/ 下所有 html/js 文件（排除 webapp 目录）
+    const assetFiles = Object.keys(zip.files).filter(
+      (name) => name.startsWith('assets/') && !name.startsWith('assets/webapp/') && !zip.files[name].dir
+        && /\.(html|js)$/i.test(name)
+    );
+
+    // 检测 getrun 特征
+    let getrunMatchCount = 0;
+    for (const filePath of assetFiles) {
+      const fileData = await zip.files[filePath].async('text');
+      if (isGetrunEncrypted(fileData)) {
+        getrunMatchCount++;
+      }
+    }
+
+    const metaValue = await extractMetaDataValue(zip, 'main');
+
+    if (getrunMatchCount >= 2) {
+      return { type: 'getrun', assetFiles, metaValue };
+    }
+    return { type: 'fullaes', assetFiles, metaValue };
+  } catch {
+    return { type: 'fullaes', assetFiles: [], metaValue: null };
+  }
+}
+
+/**
+ * 处理 APK 文件：解密 assets/webapp 或 assets 目录
  * @param {File|Blob} apkFile - 用户上传的 APK 文件
  * @param {string} password - 口令
  * @param {string} preprocess - 预处理方式: 'none' | 'preprocess1'
- * @returns {Promise<{
- *   success: boolean,
- *   metaValue: string|null,
- *   derivedKey: string|null,
- *   decryptedFiles: { path: string, content: Uint8Array, type: string }[],
- *   originalFiles: { path: string, content: Uint8Array, type: string }[],
- *   error?: string
- * }>}
+ * @param {string} encryptType - 加密方式: 'fullaes' | 'getrun'
+ * @param {string} filePreprocess - 文件预处理: 'none' | 'strip16'（仅 getrun 有效）
+ * @param {string} aesPreprocess - AES 流前预处理: 'none' | 'sub2'（仅 getrun 有效）
+ * @returns {Promise<{...}>}
  */
-export async function processApkFile(apkFile, password, preprocess = 'preprocess1') {
+export async function processApkFile(
+  apkFile, password, preprocess = 'preprocess1',
+  encryptType = 'fullaes', filePreprocess = 'none',
+  aesPreprocess = 'none'
+) {
   try {
     // 1. 读取 APK (ZIP)
     const zip = await JSZip.loadAsync(apkFile);
@@ -80,17 +119,20 @@ export async function processApkFile(apkFile, password, preprocess = 'preprocess
       };
     }
 
+    if (encryptType === 'getrun') {
+      return await processGetrun(zip, password, filePreprocess, aesPreprocess);
+    }
+
     // 2. 根据预处理方式派生 DES 密钥
     let derivedKey;
     if (preprocess === 'preprocess1') {
       derivedKey = deriveDesKey(password);
     } else {
-      // 'none' — 直接使用原始口令作为密钥
       derivedKey = password;
     }
     console.log(`password: "${password}", preprocess: "${preprocess}", derived key: "${derivedKey}"`);
 
-    // 4. 遍历 assets/webapp 目录
+    // === 全文AES 解密流程 ===
     const decryptedFiles = [];
     const originalFiles = [];
 
@@ -199,4 +241,85 @@ function getMimeType(fileName) {
     txt: 'text/plain',
   };
   return mimeMap[ext] || 'application/octet-stream';
+}
+
+/**
+ * getrun 解密流程：处理 assets/ 目录下的 html/js 文件
+ * @param {JSZip} zip
+ * @param {string} password - DES 密钥
+ * @param {string} filePreprocess - 文件预处理: 'none' | 'strip16'
+ * @param {string} aesPreprocess - AES 流前预处理: 'none' | 'sub2'
+ */
+async function processGetrun(zip, password, filePreprocess, aesPreprocess = 'none') {
+  const decryptedFiles = [];
+  const originalFiles = [];
+  const stripFirst16 = filePreprocess === 'strip16';
+
+  // 获取 assets/ 下所有文件（排除 webapp）
+  const assetFiles = Object.keys(zip.files).filter(
+    (name) => name.startsWith('assets/') && !name.startsWith('assets/webapp/') && !zip.files[name].dir
+  );
+
+  for (const filePath of assetFiles) {
+    const fileEntry = zip.files[filePath];
+    const fileData = new Uint8Array(await fileEntry.async('arraybuffer'));
+    const fileName = filePath.replace('assets/', '');
+
+    const isHtmlJs = /\.(html|js)$/i.test(fileName);
+
+    if (isHtmlJs) {
+      try {
+        // 1. 提取 getrun 载荷
+        const payload = extractGetrunPayload(fileData, stripFirst16);
+        if (!payload.success) {
+          console.warn(`getrun 提取失败: ${fileName}`, payload.error);
+          originalFiles.push({
+            path: fileName, content: fileData,
+            type: getMimeType(fileName), size: fileData.length,
+          });
+          continue;
+        }
+
+        // 2. AES 流前预处理（整体降2）
+        let hexStr = payload.hexStr;
+        if (aesPreprocess === 'sub2') {
+          hexStr = bytesSub2(hexStr);
+        }
+
+        // 3. gf.b(String) — 解析 base-18 hex → DES 解密
+        const decryptedBytes = gfBString(hexStr, password);
+        const type = getMimeType(fileName);
+
+        // 检测是否有乱码
+        const garbled = hasGarbledChars(decryptedBytes);
+
+        decryptedFiles.push({
+          path: fileName,
+          content: decryptedBytes,
+          type,
+          size: decryptedBytes.length,
+          garbled,
+        });
+      } catch (err) {
+        console.warn(`getrun 解密失败: ${fileName}`, err);
+        originalFiles.push({
+          path: fileName, content: fileData,
+          type: getMimeType(fileName), size: fileData.length,
+        });
+      }
+    } else {
+      originalFiles.push({
+        path: fileName, content: fileData,
+        type: getMimeType(fileName), size: fileData.length,
+      });
+    }
+  }
+
+  return {
+    success: true,
+    metaValue: password,
+    derivedKey: password,
+    decryptedFiles,
+    originalFiles,
+  };
 }

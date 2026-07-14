@@ -1,7 +1,7 @@
 <script setup>
-import { ref, computed, nextTick } from 'vue'
-import { ElMessage } from 'element-plus'
-import { processApkFile, detectMetaData } from './utils/apkUtils.js'
+import { ref, computed, nextTick, watch } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { processApkFile, detectMetaData, detectEncryptionType } from './utils/apkUtils.js'
 import { saveAs } from 'file-saver'
 import JSZip from 'jszip'
 import hljs from 'highlight.js'
@@ -37,7 +37,15 @@ const showSource = ref(false) // HTML 预览时是否显示源代码
 const manualPassword = ref('bzyapp')
 const pendingApkFile = ref(null) // 等待重试的 APK 文件
 const passwordFound = ref(false) // APK 中是否找到口令
-const preprocessType = ref('none') // 预处理方式: 'none' | 'preprocess1'
+const preprocessType = ref('none') // 口令预处理: 'none' | 'preprocess1'
+
+// 加密方式相关
+const encryptType = ref('fullaes') // 'fullaes' | 'getrun'
+const filePreprocess = ref('none') // 文件预处理: 'none' | 'strip16'（仅 getrun）
+const aesPreprocess = ref('none') // AES 流前预处理: 'none' | 'sub2'（仅 getrun）
+
+// 保存文件引用（用于重新解密）
+const currentApkFile = ref(null)
 
 // 文件树数据
 const fileTree = computed(() => {
@@ -126,22 +134,40 @@ async function handleUpload(file) {
 
   try {
     await sleep(100)
-    progressText.value = '正在解析 AndroidManifest.xml...'
-    progressPercent.value = 30
+    progressText.value = '正在检测加密类型...'
+    progressPercent.value = 20
 
-    // 先检测 APK 中是否有口令
+    // 检测加密类型
+    const encInfo = await detectEncryptionType(file)
     const { metaValue: detectedPwd, found } = await detectMetaData(file)
 
     pendingApkFile.value = file
+    currentApkFile.value = file
     passwordFound.value = found
+    encryptType.value = 'fullaes'
+    filePreprocess.value = 'none'
 
-    if (found) {
-      // 找到口令，预填并默认预处理1
+    // 如果是 getrun 加密，弹出确认框
+    if (encInfo.type === 'getrun') {
+      try {
+        await ElMessageBox.confirm(
+          '检测到文件符合旧版 getrun 加密特征，是否尝试解密？',
+          '检测到加密方式',
+          { confirmButtonText: '是', cancelButtonText: '否', type: 'warning' }
+        )
+        encryptType.value = 'getrun'
+        filePreprocess.value = 'none'
+      } catch {
+        // 用户选否，走全文AES
+        encryptType.value = 'fullaes'
+      }
+    }
+
+    if (passwordFound.value) {
       manualPassword.value = detectedPwd
       preprocessType.value = 'preprocess1'
       errorMsg.value = '已从 APK 中检测到口令，请确认或修改后解密'
     } else {
-      // 未找到口令，使用默认口令，不处理
       manualPassword.value = 'bzyapp'
       preprocessType.value = 'none'
       errorMsg.value = '未找到口令，请输入正确口令'
@@ -155,8 +181,8 @@ async function handleUpload(file) {
   }
 }
 
-// 使用手动口令解密
-async function retryWithPassword() {
+// 执行解密
+async function doDecrypt() {
   if (!pendingApkFile.value) return
   if (!manualPassword.value.trim()) {
     ElMessage.warning('请输入口令')
@@ -172,13 +198,16 @@ async function retryWithPassword() {
     const result = await processApkFile(
       pendingApkFile.value,
       manualPassword.value.trim(),
-      preprocessType.value
+      preprocessType.value,
+      encryptType.value,
+      filePreprocess.value,
+      aesPreprocess.value
     )
 
     if (!result.success) {
-      errorMsg.value = result.error || '口令错误，请重试'
+      errorMsg.value = result.error || '解密失败'
       step.value = 'needPassword'
-      ElMessage.error('口令错误，请重试')
+      ElMessage.error(result.error || '解密失败')
       return
     }
 
@@ -188,8 +217,38 @@ async function retryWithPassword() {
     derivedKey.value = result.derivedKey
     decryptedFiles.value = result.decryptedFiles
     originalFiles.value = result.originalFiles
-    pendingApkFile.value = null
 
+    // 检查 getrun 解密是否有乱码
+    if (encryptType.value === 'getrun') {
+      const hasGarbled = decryptedFiles.value.some(f => f.garbled)
+      if (hasGarbled) {
+        if (filePreprocess.value === 'none') {
+          try {
+            await ElMessageBox.confirm(
+              '解密结果存在乱码，是否尝试自修复（删16位）？',
+              '提示',
+              { confirmButtonText: '是', cancelButtonText: '否', type: 'warning' }
+            )
+            filePreprocess.value = 'strip16'
+            pendingApkFile.value = pendingApkFile.value
+            return await doDecrypt()
+          } catch { /* 用户选否，继续 */ }
+        } else if (aesPreprocess.value === 'none') {
+          try {
+            await ElMessageBox.confirm(
+              '发现似乎存在 AES 流前加密，是否尝试自修复（整体降2）？',
+              '提示',
+              { confirmButtonText: '是', cancelButtonText: '否', type: 'warning' }
+            )
+            aesPreprocess.value = 'sub2'
+            pendingApkFile.value = pendingApkFile.value
+            return await doDecrypt()
+          } catch { /* 用户选否，继续 */ }
+        }
+      }
+    }
+
+    pendingApkFile.value = null
     step.value = 'result'
     ElMessage.success(`解密成功！共处理 ${totalFiles.value} 个文件`)
   } catch (err) {
@@ -197,6 +256,22 @@ async function retryWithPassword() {
     step.value = 'needPassword'
     ElMessage.error('解密失败，请检查口令是否正确')
   }
+}
+
+// 使用手动口令解密（别名，供模板调用）
+async function retryWithPassword() {
+  return doDecrypt()
+}
+
+// 重新解密（当顶栏选项改变时，仅在结果页触发）
+async function reDecrypt() {
+  if (step.value !== 'result') return
+  const file = currentApkFile.value || pendingApkFile.value
+  if (!file) return
+
+  ElMessage.info('选项已更改，正在重新解密...')
+  pendingApkFile.value = file
+  return doDecrypt()
 }
 
 function sleep(ms) {
@@ -285,9 +360,13 @@ function resetUpload() {
   previewType.value = 'none'
   showSource.value = false
   pendingApkFile.value = null
+  currentApkFile.value = null
   manualPassword.value = 'bzyapp'
   passwordFound.value = false
   preprocessType.value = 'none'
+  encryptType.value = 'fullaes'
+  filePreprocess.value = 'none'
+  aesPreprocess.value = 'none'
 }
 </script>
 
@@ -303,6 +382,48 @@ function resetUpload() {
       </h1>
       <p class="subtitle">上传加密的 APK 文件，解密并预览 assets/webapp 目录内容</p>
     </header>
+
+    <!-- ===== 顶栏（上传后显示） ===== -->
+      <div v-if="step !== 'upload'" class="top-bar">
+        <div class="top-bar-inner">
+          <div class="top-bar-item">
+            <span class="top-bar-label">加密方式</span>
+            <el-select
+              v-model="encryptType"
+              size="small"
+              style="width: 130px"
+              @change="reDecrypt"
+            >
+              <el-option label="全文AES" value="fullaes" />
+              <el-option label="getrun" value="getrun" />
+            </el-select>
+          </div>
+          <div v-if="encryptType === 'getrun'" class="top-bar-item">
+            <span class="top-bar-label">文件预处理</span>
+            <el-select
+              v-model="filePreprocess"
+              size="small"
+              style="width: 130px"
+              @change="reDecrypt"
+            >
+              <el-option label="不处理" value="none" />
+              <el-option label="删16位" value="strip16" />
+            </el-select>
+          </div>
+          <div v-if="encryptType === 'getrun'" class="top-bar-item">
+            <span class="top-bar-label">AES预处理</span>
+            <el-select
+              v-model="aesPreprocess"
+              size="small"
+              style="width: 130px"
+              @change="reDecrypt"
+            >
+              <el-option label="不处理" value="none" />
+              <el-option label="整体降2" value="sub2" />
+            </el-select>
+          </div>
+        </div>
+      </div>
 
     <main class="app-main">
       <!-- ===== 上传区域 ===== -->
@@ -395,6 +516,12 @@ function resetUpload() {
             <div class="info-item">
               <span class="info-label">派生密钥</span>
               <el-tag>{{ derivedKey || '(空)' }}</el-tag>
+            </div>
+            <div class="info-item">
+              <span class="info-label">加密方式</span>
+              <el-tag :type="encryptType === 'getrun' ? 'warning' : 'primary'">
+                {{ encryptType === 'getrun' ? 'getrun' : '全文AES' }}
+              </el-tag>
             </div>
             <div class="info-item">
               <span class="info-label">解密文件</span>
@@ -590,6 +717,34 @@ body {
 .subtitle {
   font-size: 15px;
   opacity: 0.85;
+}
+
+/* ===== 顶栏 ===== */
+.top-bar {
+  background: rgba(255, 255, 255, 0.9);
+  border-radius: 10px;
+  padding: 8px 20px;
+  margin-bottom: 12px;
+}
+
+.top-bar-inner {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  flex-wrap: wrap;
+}
+
+.top-bar-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.top-bar-label {
+  font-size: 13px;
+  color: #606266;
+  white-space: nowrap;
+  font-weight: 500;
 }
 
 /* ===== 主内容 ===== */

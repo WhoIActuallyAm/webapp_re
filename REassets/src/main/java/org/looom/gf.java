@@ -42,8 +42,13 @@ public class gf {
         return this.d.doFinal(bArr);
     }
 
-    public String b(String str) throws UnsupportedEncodingException, IllegalBlockSizeException, BadPaddingException {
-        return new String(a(a(str)), "UTF-8");
+    public String b(String str) {
+        try {
+            return new String(a(a(str)), "UTF-8");
+        } catch (Exception e) {
+            e.printStackTrace();
+            return null;
+        }
     }
 
     private Key b(byte[] bArr) {

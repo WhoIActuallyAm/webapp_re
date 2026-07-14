@@ -163,3 +163,135 @@ export function xorDecrypt(base64Str, key) {
   }
   return new TextDecoder('utf-8').decode(bytes);
 }
+
+/**
+ * 检测是否为 getrun 加密（匹配 window\['\\x??...'\] 模式）
+ * @param {string} content - 文件内容
+ * @returns {boolean} 是否匹配
+ */
+export function isGetrunEncrypted(content) {
+  const regex = /window\['(?:\\x[0-9A-Fa-f]{2})+']/g;
+  const matches = content.match(regex);
+  return matches && matches.length >= 2;
+}
+
+/**
+ * 从 getrun 加密的文件中提取并初步解密内容
+ * 流程：找最后一个 ('\\x...') → 解码 \x?? → base64 → 可选删前16位 → 解base64
+ * 对 html 和 js 文件通用
+ * @param {Uint8Array} fileData - 文件字节数据
+ * @param {boolean} stripFirst16 - 是否删除 base64 开头 16 位
+ * @returns {{ success: boolean, hexStr?: string, error?: string }}
+ */
+export function extractGetrunPayload(fileData, stripFirst16 = false) {
+  try {
+    const decoder = new TextDecoder('utf-8', { fatal: false });
+    const content = decoder.decode(fileData);
+
+    // 提取 \x?? 编码的原始文本
+    // 先尝试匹配 '(\x??...)' 整体模式（捕获组1为\x??内容）
+    const payloadRegex = /\('((?:\\x[0-9A-Fa-f]{2})+)'\)/g;
+    let pm;
+    let rawHexEncoded = null;
+    while ((pm = payloadRegex.exec(content)) !== null) {
+      rawHexEncoded = pm[1];
+    }
+
+    // 如果正则没匹配到，回退：找最后一个 (' 到下一个 ')
+    if (rawHexEncoded === null) {
+      const lastOpen = content.lastIndexOf("('");
+      if (lastOpen === -1) {
+        return { success: false, error: "未找到 ('" };
+      }
+      const closeIdx = content.indexOf("')", lastOpen + 2);
+      if (closeIdx === -1) {
+        return { success: false, error: '未找到闭合 ")' };
+      }
+      rawHexEncoded = content.substring(lastOpen + 2, closeIdx);
+    }
+
+    if (!rawHexEncoded) {
+      return { success: false, error: '提取内容为空' };
+    }
+
+    // 解码 \x?? → 原始字符串（base64）
+    let base64Str = '';
+    const hexSeqRegex = /\\x([0-9A-Fa-f]{2})/g;
+    let m;
+    while ((m = hexSeqRegex.exec(rawHexEncoded)) !== null) {
+      base64Str += String.fromCharCode(parseInt(m[1], 16));
+    }
+
+    if (!base64Str) {
+      return { success: false, error: '\\x 解码后为空' };
+    }
+
+    // 可选删除开头 16 位
+    let processedBase64 = base64Str;
+    if (stripFirst16 && base64Str.length > 16) {
+      processedBase64 = base64Str.substring(16);
+    }
+
+    // Base64 解码 → 得到十六进制字符串
+    let decodedStr;
+    try {
+      const rawBytes = Uint8Array.from(atob(processedBase64), c => c.charCodeAt(0));
+      decodedStr = new TextDecoder('utf-8', { fatal: false }).decode(rawBytes);
+    } catch {
+      return { success: false, error: 'Base64 解码失败' };
+    }
+
+    if (!decodedStr) {
+      return { success: false, error: 'Base64 解码结果为空' };
+    }
+
+    return { success: true, hexStr: decodedStr };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+}
+
+/**
+ * 实现 Java gf.b(String) 方法：解析 base-18 十六进制 → DES 解密
+ * @param {string} hexStr - base-18 编码的十六进制字符串
+ * @param {string} desKey - DES 密钥（取前 8 字节）
+ * @returns {Uint8Array} 解密后的字节数据
+ */
+export function gfBString(hexStr, desKey) {
+  // Step 1: 解析 base-18 十六进制为字节 (对应 gf.a(String))
+  const bytes = parseHexRadix18(hexStr);
+  // Step 2: DES 解密 (对应 gf.a(byte[]))
+  return desDecrypt(bytes, desKey);
+}
+
+/**
+ * 将字符串的每个字节整体降 2（对应 Java: bytes[i] = (byte)(bytes[i] - 2)）
+ * 用于 getrun 中 AES 流前加密的解密
+ * @param {string} str - 输入字符串
+ * @returns {string} 每个字节减 2 后的字符串
+ */
+export function bytesSub2(str) {
+  const bytes = new TextEncoder().encode(str);
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = bytes[i] - 2;
+  }
+  return new TextDecoder('utf-8').decode(bytes);
+}
+
+/**
+ * 检测解密后的文本是否包含不可见字符（乱码）
+ * @param {Uint8Array} data - 解密后的字节
+ * @returns {boolean} 是否包含不可见字符
+ */
+export function hasGarbledChars(data) {
+  for (let i = 0; i < data.length; i++) {
+    const b = data[i];
+    // 可打印 ASCII + 常见中文/UTF-8 字节范围
+    if (b === 0x09 || b === 0x0a || b === 0x0d) continue; // tab, LF, CR
+    if (b >= 0x20 && b <= 0x7e) continue; // 可打印 ASCII
+    if (b >= 0xc0 && b <= 0xfd) continue; // 可能是 UTF-8 多字节开头
+    if (b >= 0x80 && b <= 0xbf) continue; // UTF-8 后续字节
+    return true; // 发现不可见控制字符
+  }
+  return false;
+}
