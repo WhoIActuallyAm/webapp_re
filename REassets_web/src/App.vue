@@ -1,7 +1,7 @@
 <script setup>
 import { ref, computed, nextTick } from 'vue'
 import { ElMessage } from 'element-plus'
-import { processApkFile } from './utils/apkUtils.js'
+import { processApkFile, detectMetaData } from './utils/apkUtils.js'
 import { saveAs } from 'file-saver'
 import JSZip from 'jszip'
 import hljs from 'highlight.js'
@@ -17,7 +17,7 @@ import {
 } from '@element-plus/icons-vue'
 
 // 状态管理
-const step = ref('upload') // upload | processing | result | error
+const step = ref('upload') // upload | processing | result | error | needPassword
 const apkFileName = ref('')
 const apkFileSize = ref(0)
 const metaValue = ref('')
@@ -32,6 +32,12 @@ const previewContent = ref('')
 const previewType = ref('none') // 'html' | 'code' | 'image' | 'none'
 const previewUrl = ref('')
 const showSource = ref(false) // HTML 预览时是否显示源代码
+
+// 手动口令相关
+const manualPassword = ref('bzyapp')
+const pendingApkFile = ref(null) // 等待重试的 APK 文件
+const passwordFound = ref(false) // APK 中是否找到口令
+const preprocessType = ref('none') // 预处理方式: 'none' | 'preprocess1'
 
 // 文件树数据
 const fileTree = computed(() => {
@@ -116,7 +122,6 @@ async function handleUpload(file) {
   progressText.value = '正在读取 APK 文件...'
   progressPercent.value = 10
 
-  // 让 UI 更新
   await nextTick()
 
   try {
@@ -124,12 +129,56 @@ async function handleUpload(file) {
     progressText.value = '正在解析 AndroidManifest.xml...'
     progressPercent.value = 30
 
-    const result = await processApkFile(file)
+    // 先检测 APK 中是否有口令
+    const { metaValue: detectedPwd, found } = await detectMetaData(file)
+
+    pendingApkFile.value = file
+    passwordFound.value = found
+
+    if (found) {
+      // 找到口令，预填并默认预处理1
+      manualPassword.value = detectedPwd
+      preprocessType.value = 'preprocess1'
+      errorMsg.value = '已从 APK 中检测到口令，请确认或修改后解密'
+    } else {
+      // 未找到口令，使用默认口令，不处理
+      manualPassword.value = 'bzyapp'
+      preprocessType.value = 'none'
+      errorMsg.value = '未找到口令，请输入正确口令'
+    }
+
+    step.value = 'needPassword'
+  } catch (err) {
+    errorMsg.value = err.message || '处理失败'
+    step.value = 'error'
+    ElMessage.error(errorMsg.value)
+  }
+}
+
+// 使用手动口令解密
+async function retryWithPassword() {
+  if (!pendingApkFile.value) return
+  if (!manualPassword.value.trim()) {
+    ElMessage.warning('请输入口令')
+    return
+  }
+
+  step.value = 'processing'
+  progressText.value = '正在解密...'
+  progressPercent.value = 30
+  await nextTick()
+
+  try {
+    const result = await processApkFile(
+      pendingApkFile.value,
+      manualPassword.value.trim(),
+      preprocessType.value
+    )
 
     if (!result.success) {
-      errorMsg.value = result.error || '未知错误'
-      step.value = 'error'
-      ElMessage.error(errorMsg.value)
+      errorMsg.value = result.error || '口令错误，请重试'
+      step.value = 'needPassword'
+      ElMessage.error('口令错误，请重试')
       return
     }
 
@@ -139,13 +188,14 @@ async function handleUpload(file) {
     derivedKey.value = result.derivedKey
     decryptedFiles.value = result.decryptedFiles
     originalFiles.value = result.originalFiles
+    pendingApkFile.value = null
 
     step.value = 'result'
     ElMessage.success(`解密成功！共处理 ${totalFiles.value} 个文件`)
   } catch (err) {
-    errorMsg.value = err.message || '处理失败'
-    step.value = 'error'
-    ElMessage.error(errorMsg.value)
+    errorMsg.value = err.message || '解密失败'
+    step.value = 'needPassword'
+    ElMessage.error('解密失败，请检查口令是否正确')
   }
 }
 
@@ -234,6 +284,10 @@ function resetUpload() {
   previewContent.value = ''
   previewType.value = 'none'
   showSource.value = false
+  pendingApkFile.value = null
+  manualPassword.value = 'bzyapp'
+  passwordFound.value = false
+  preprocessType.value = 'none'
 }
 </script>
 
@@ -269,6 +323,42 @@ function resetUpload() {
             <p class="upload-hint">仅支持 .apk 格式，所有操作均在浏览器本地完成</p>
           </div>
         </el-upload>
+      </section>
+
+      <!-- ===== 口令确认 ===== -->
+      <section v-if="step === 'needPassword'" class="password-section">
+        <el-card class="password-card" shadow="always">
+          <div class="password-content">
+            <el-icon :size="48" :color="passwordFound ? '#409eff' : '#e6a23c'" style="margin-bottom: 16px">
+              <Lock />
+            </el-icon>
+            <h2 class="password-title">{{ passwordFound ? '检测到口令' : '未找到口令' }}</h2>
+            <p class="password-desc">{{ errorMsg }}</p>
+            <div class="password-input-row">
+              <el-input
+                v-model="manualPassword"
+                :placeholder="manualPassword"
+                size="large"
+                clearable
+                style="max-width: 360px"
+                @keyup.enter="retryWithPassword"
+              />
+            </div>
+            <div class="preprocess-row">
+              <span class="preprocess-label">口令预处理</span>
+              <el-select v-model="preprocessType" style="width: 160px">
+                <el-option label="不处理" value="none" />
+                <el-option label="预处理1" value="preprocess1" />
+              </el-select>
+            </div>
+            <el-button type="primary" size="large" style="margin-top: 12px" @click="retryWithPassword">
+              确认解密
+            </el-button>
+          </div>
+          <div class="password-actions">
+            <el-button size="small" @click="resetUpload">返回重新选择</el-button>
+          </div>
+        </el-card>
       </section>
 
       <!-- ===== 处理中 ===== -->
@@ -554,6 +644,74 @@ body {
 .upload-hint {
   font-size: 13px !important;
   color: #909399 !important;
+}
+
+/* ===== 口令输入 ===== */
+.password-section {
+  display: flex;
+  justify-content: center;
+  padding: 60px 0;
+}
+
+.password-card {
+  width: 100%;
+  max-width: 500px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.95);
+}
+
+.password-content {
+  text-align: center;
+  padding: 40px 20px 20px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+
+.password-title {
+  font-size: 20px;
+  font-weight: 600;
+  color: #303133;
+}
+
+.password-desc {
+  font-size: 14px;
+  color: #606266;
+  margin-bottom: 8px;
+}
+
+.password-input-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+
+.preprocess-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.preprocess-label {
+  font-size: 14px;
+  color: #606266;
+  white-space: nowrap;
+}
+
+.password-hint {
+  font-size: 12px;
+  color: #909399;
+  margin-top: 4px;
+}
+
+.password-actions {
+  text-align: center;
+  padding: 0 20px 20px;
 }
 
 /* ===== 处理中 ===== */

@@ -36,36 +36,59 @@ function shouldDecrypt(fileName) {
 }
 
 /**
+ * 仅检测 APK 中的 meta-data 口令（不解密文件）
+ * @param {File|Blob} apkFile - 用户上传的 APK 文件
+ * @returns {Promise<{ metaValue: string|null, found: boolean }>}
+ */
+export async function detectMetaData(apkFile) {
+  try {
+    const zip = await JSZip.loadAsync(apkFile);
+    const metaValue = await extractMetaDataValue(zip, 'main');
+    return { metaValue, found: !!metaValue };
+  } catch {
+    return { metaValue: null, found: false };
+  }
+}
+
+/**
  * 处理 APK 文件：解密 assets/webapp 目录
  * @param {File|Blob} apkFile - 用户上传的 APK 文件
+ * @param {string} password - 口令
+ * @param {string} preprocess - 预处理方式: 'none' | 'preprocess1'
  * @returns {Promise<{
  *   success: boolean,
  *   metaValue: string|null,
+ *   derivedKey: string|null,
  *   decryptedFiles: { path: string, content: Uint8Array, type: string }[],
  *   originalFiles: { path: string, content: Uint8Array, type: string }[],
  *   error?: string
  * }>}
  */
-export async function processApkFile(apkFile) {
+export async function processApkFile(apkFile, password, preprocess = 'preprocess1') {
   try {
     // 1. 读取 APK (ZIP)
     const zip = await JSZip.loadAsync(apkFile);
 
-    // 2. 从 AndroidManifest.xml 提取 meta-data
-    const metaValue = await extractMetaDataValue(zip, 'main');
-    if (!metaValue) {
+    if (!password) {
       return {
         success: false,
         metaValue: null,
+        derivedKey: null,
         decryptedFiles: [],
         originalFiles: [],
-        error: '未在 AndroidManifest.xml 中找到 meta-data name="main" 的值',
+        error: '口令不能为空',
       };
     }
 
-    // 3. 派生 DES 密钥
-    const derivedKey = deriveDesKey(metaValue);
-    console.log(`meta-data value: "${metaValue}", derived key: "${derivedKey}"`);
+    // 2. 根据预处理方式派生 DES 密钥
+    let derivedKey;
+    if (preprocess === 'preprocess1') {
+      derivedKey = deriveDesKey(password);
+    } else {
+      // 'none' — 直接使用原始口令作为密钥
+      derivedKey = password;
+    }
+    console.log(`password: "${password}", preprocess: "${preprocess}", derived key: "${derivedKey}"`);
 
     // 4. 遍历 assets/webapp 目录
     const decryptedFiles = [];
@@ -116,7 +139,7 @@ export async function processApkFile(apkFile) {
 
     return {
       success: true,
-      metaValue,
+      metaValue: password,
       derivedKey,
       decryptedFiles,
       originalFiles,

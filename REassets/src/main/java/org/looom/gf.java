@@ -100,6 +100,6 @@ class gf_tools{
         return sb2.toString();
     }
     public static gf gf_new(){
-        return new gf(d("hzxqff"));
+        return new gf("bzyapp");
     }
 }
